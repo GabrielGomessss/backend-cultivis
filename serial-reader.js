@@ -1,8 +1,17 @@
 
+require("dotenv").config();
+
 const { SerialPort } = require("serialport");
 const { ReadlineParser } = require("@serialport/parser-readline");
+const { createClient } = require("@supabase/supabase-js");
 
-// Configuração da comunicação USB com o ESP32
+// SUPABASE
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_ROLE_KEY
+);
+
+// PORTA SERIAL DO ESP32
 const port = new SerialPort({
   path: "COM3",
   baudRate: 115200,
@@ -12,6 +21,7 @@ const parser = port.pipe(
   new ReadlineParser({ delimiter: "\n" })
 );
 
+// INICIALIZAÇÃO
 console.log("CULTIVIS - LEITOR SERIAL");
 console.log("Aguardando dados do ESP32...");
 
@@ -20,39 +30,100 @@ port.on("open", () => {
 });
 
 port.on("error", (erro) => {
-  console.error("Erro na comunicação serial:", erro.message);
+  console.error("ERRO SERIAL:", erro.message);
 });
 
+// VARIÁVEIS DOS SENSORES
+let temperatura = null;
+let umidade = null;
+let ph = null;
+
+// CONTROLE DE ENVIO
+const INTERVALO_ENVIO = 60 * 1000; // 60 segundos
+let ultimoEnvio = Date.now();
+let enviando = false;
+
+// FUNÇÃO PARA ENVIAR AO SUPABASE
+async function enviarSupabase() {
+  enviando = true;
+  ultimoEnvio = Date.now();
+
+  console.log("Enviando leitura ao Supabase...");
+
+  try {
+    const { error } = await supabase
+      .from("leituras_sensores")
+      .insert({
+        sensor_id: 1,
+        valortemp: temperatura,
+        valorhumidade: umidade,
+        valorph: ph,
+        data_hora: new Date().toISOString(),
+      });
+
+    if (error) {
+      console.error("ERRO SUPABASE:", error.message);
+      return;
+    }
+
+    console.log("LEITURA ENVIADA COM SUCESSO!");
+    console.log("Temperatura:", temperatura);
+    console.log("Umidade:", umidade);
+    console.log("pH:", ph);
+    console.log("Próximo envio permitido em 60 segundos.");
+
+  } catch (erro) {
+    console.error("ERRO AO ENVIAR:", erro.message);
+
+  } finally {
+    enviando = false;
+  }
+}
+
+// RECEBIMENTO DOS DADOS DO ESP32
 parser.on("data", async (linha) => {
   const mensagem = linha.trim();
 
-  if (!mensagem.startsWith("{")) {
-    return;
-  }
+  console.log("SERIAL:", mensagem);
 
-  try {
-    const dados = JSON.parse(mensagem);
+  // TEMPERATURA E UMIDADE
+  const leituraAmbiente = mensagem.match(
+    /Temperatura:\s*([\d.,]+)\s*C\s*\|\s*Umidade:\s*([\d.,]+)\s*%/i
+  );
 
-    console.log("Leitura recebida:", dados);
-
-    const resposta = await fetch(
-      "http://localhost:3000/api/leituras",
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify(dados),
-      }
+  if (leituraAmbiente) {
+    temperatura = Number(
+      leituraAmbiente[1].replace(",", ".")
     );
 
-    if (resposta.ok) {
-      console.log("Dados enviados ao servidor Node.js!");
-    } else {
-      console.error("Erro HTTP:", resposta.status);
-    }
+    umidade = Number(
+      leituraAmbiente[2].replace(",", ".")
+    );
+  }
 
-  } catch (erro) {
-    console.error("Erro ao processar leitura:", erro.message);
+  // pH
+  const leituraPH = mensagem.match(/pH:\s*([\d.,]+)/i);
+
+  if (leituraPH) {
+    const valorPH = Number(
+      leituraPH[1].replace(",", ".")
+    );
+
+    if (Number.isFinite(valorPH)) {
+      ph = valorPH;
+    }
+  }
+
+  // VERIFICA SE JÁ PODE ENVIAR
+  const intervaloCompleto =
+    Date.now() - ultimoEnvio >= INTERVALO_ENVIO;
+
+  if (
+    temperatura !== null &&
+    umidade !== null &&
+    intervaloCompleto &&
+    !enviando
+  ) {
+    await enviarSupabase();
   }
 });
